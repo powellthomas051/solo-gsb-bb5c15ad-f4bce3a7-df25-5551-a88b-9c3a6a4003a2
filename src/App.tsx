@@ -3,6 +3,7 @@ import Toolbar from './components/Toolbar';
 import Timeline from './components/Timeline';
 import CueList from './components/CueList';
 import ShadowPanel from './components/ShadowPanel';
+import DriftPanel from './components/DriftPanel';
 import type { Constraints, Cue, SilenceStatus } from './types';
 import { formatClock, parseSrt, serializeSrt } from './lib/srt';
 import {
@@ -22,6 +23,12 @@ import {
   replaceHistory,
   undoHistory
 } from './lib/cues';
+import {
+  applyDriftPlan,
+  buildDriftPlan,
+  formatDriftInput,
+  resolveDriftRange
+} from './lib/drift';
 import { detectSilences, type WindowLevels } from './lib/silence';
 import {
   AbortToken,
@@ -69,6 +76,16 @@ export default function App() {
   // A-B 循环试听：开关与前后余量（区间由选中字幕推导，见下方 loopRange）
   const [loopEnabled, setLoopEnabled] = useState(false);
   const [loopMargins, setLoopMargins] = useState<LoopMargins>(DEFAULT_LOOP_MARGINS);
+
+  // 区间漂移校准：Shift 框选的首末锚点 id、面板开关与目标锚点输入文本。
+  // firstId/lastId 仅记录框选意图；区间按当前字幕时间顺序解析（撤销/重做后仍可复现）。
+  const [driftFirstId, setDriftFirstId] = useState<string | null>(null);
+  const [driftLastId, setDriftLastId] = useState<string | null>(null);
+  const [driftOpen, setDriftOpen] = useState(false);
+  const [driftTargetStart, setDriftTargetStart] = useState('');
+  const [driftTargetEnd, setDriftTargetEnd] = useState('');
+  // 「定位首个冲突」请求令牌：变化即驱动时间轴滚动
+  const [driftLocateNonce, setDriftLocateNonce] = useState(0);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUrlRef = useRef<string | null>(null);
@@ -299,6 +316,117 @@ export default function App() {
     setLoopEnabled(on);
   }, []);
 
+  /* ---------------- 区间漂移校准 ---------------- */
+
+  const clearDrift = useCallback(() => {
+    setDriftFirstId(null);
+    setDriftLastId(null);
+    setDriftOpen(false);
+    setDriftTargetStart('');
+    setDriftTargetEnd('');
+  }, []);
+
+  // 当前框选区间（按时间排序）；锚点在撤销/重做等情况下失效时为 null
+  const driftRange = useMemo(
+    () =>
+      driftFirstId && driftLastId
+        ? resolveDriftRange(cues, driftFirstId, driftLastId)
+        : null,
+    [cues, driftFirstId, driftLastId]
+  );
+
+  // 输入即时驱动计划（含冲突），供面板与时间轴预览共用
+  const driftPlan = useMemo(
+    () =>
+      driftOpen && driftRange
+        ? buildDriftPlan(
+            cues,
+            driftRange[0].id,
+            driftRange[driftRange.length - 1].id,
+            driftTargetStart,
+            driftTargetEnd,
+            constraints
+          )
+        : null,
+    [driftOpen, driftRange, cues, driftTargetStart, driftTargetEnd, constraints]
+  );
+
+  const driftRangeIds = useMemo(() => new Set((driftRange ?? []).map((c) => c.id)), [driftRange]);
+
+  // 面板打开后若区间失效（理论上导入 / 历史变更都会主动清空，此处兜底），关闭面板
+  useEffect(() => {
+    if (driftOpen && !driftRange) clearDrift();
+  }, [driftOpen, driftRange, clearDrift]);
+
+  // 列表点击：普通点击重设锚点（并关闭既有框选的目标输入）；
+  // Shift+点击从锚点扩展为连续区间（首次 Shift 点击以当前选中条为锚点），
+  // 首次框选时用锚点原始时间预填目标输入。
+  const handleListSelect = useCallback(
+    (id: string, additive: boolean) => {
+      setSelectedId(id);
+      const anchorId = driftFirstId ?? (additive ? selectedId : null);
+      if (!additive || !anchorId || anchorId === id) {
+        setDriftFirstId(id);
+        setDriftLastId(id);
+        // 普通点击只是选择，不自动打开面板；已打开时保持打开并重置输入
+        if (driftOpen) {
+          const cue = cues.find((c) => c.id === id);
+          setDriftTargetStart(cue ? formatDriftInput(cue.start) : '');
+          setDriftTargetEnd(cue ? formatDriftInput(cue.end) : '');
+        }
+        return;
+      }
+      setDriftFirstId(anchorId);
+      setDriftLastId(id);
+      setDriftOpen(true);
+      const next = resolveDriftRange(cues, anchorId, id);
+      if (next && next.length > 0) {
+        // 起点锚点沿用区间首条，目标起点保持首锚点输入（未输入则预填原值）
+        setDriftTargetStart((prev) => prev || formatDriftInput(next[0].start));
+        setDriftTargetEnd(formatDriftInput(next[next.length - 1].end));
+      }
+    },
+    [cues, driftFirstId, selectedId, driftOpen]
+  );
+
+  // 「区间漂移」入口：以当前锚点（无 Shift 选区时即当前单条）开启面板
+  const handleStartDrift = useCallback(() => {
+    const anchorId = driftFirstId ?? selectedId;
+    if (!anchorId) return;
+    setDriftFirstId(anchorId);
+    setDriftLastId(anchorId);
+    setSelectedId(anchorId);
+    setDriftOpen(true);
+    const cue = cues.find((c) => c.id === anchorId);
+    setDriftTargetStart(cue ? formatDriftInput(cue.start) : '');
+    setDriftTargetEnd(cue ? formatDriftInput(cue.end) : '');
+  }, [cues, driftFirstId, selectedId]);
+
+  const handleLocateConflict = useCallback(() => {
+    const conflict = driftPlan?.conflict;
+    if (!conflict) return;
+    if (conflict.cueId) setSelectedId(conflict.cueId);
+    if (conflict.time !== null) {
+      setDriftLocateNonce((n) => n + 1);
+    }
+    pushToast('warn', conflict.message);
+  }, [driftPlan, pushToast]);
+
+  const handleApplyDrift = useCallback(() => {
+    if (!driftPlan || driftPlan.conflict) {
+      // 非法提交：定位首个冲突，不进入历史
+      handleLocateConflict();
+      return;
+    }
+    const next = applyDriftPlan(cues, driftPlan);
+    setHistory((h) => commitHistory(h, next));
+    pushToast(
+      'info',
+      `区间漂移已提交：${driftPlan.range.length} 条 · 缩放 ${(driftPlan.scale * 100).toFixed(1)}%（可撤销）`
+    );
+    clearDrift();
+  }, [cues, driftPlan, clearDrift, handleLocateConflict, pushToast]);
+
   /* ---------------- SRT ---------------- */
 
   const handleImportSrt = useCallback(
@@ -313,23 +441,36 @@ export default function App() {
         setHistory((h) => replaceHistory(h, result.cues));
         setSrtName(file.name);
         setSelectedId(result.cues[0]?.id ?? null);
+        // 切换文件清空漂移预览
+        clearDrift();
         pushToast('info', `已导入 ${result.cues.length} 条字幕：${file.name}`);
         result.warnings.forEach((w) => pushToast('warn', w));
       };
       reader.onerror = () => pushToast('error', `读取文件失败：${file.name}`);
       reader.readAsText(file, 'utf-8');
     },
-    [pushToast]
+    [pushToast, clearDrift]
   );
 
   /* ---------------- 历史 ---------------- */
 
-  const commit = useCallback((next: Cue[]) => {
-    setHistory((h) => commitHistory(h, next));
-  }, []);
+  // 任何历史变更（拖放提交 / 漂移提交 / 撤销 / 重做）后，未提交的漂移预览都会过期：清空
+  const commit = useCallback(
+    (next: Cue[]) => {
+      setHistory((h) => commitHistory(h, next));
+      clearDrift();
+    },
+    [clearDrift]
+  );
 
-  const undo = useCallback(() => setHistory((h) => undoHistory(h)), []);
-  const redo = useCallback(() => setHistory((h) => redoHistory(h)), []);
+  const undo = useCallback(() => {
+    setHistory((h) => undoHistory(h));
+    clearDrift();
+  }, [clearDrift]);
+  const redo = useCallback(() => {
+    setHistory((h) => redoHistory(h));
+    clearDrift();
+  }, [clearDrift]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -387,6 +528,17 @@ export default function App() {
       parts.push(`循环待机：${loopDisableText(loopDisabled)}`);
     }
     if (shadowBusy) parts.push('正在跟读录音');
+    if (driftOpen && driftRange) {
+      parts.push(
+        driftPlan?.conflict
+          ? `区间漂移预览中：${driftRange.length} 条 · ⛔ ${driftPlan.conflict.message}`
+          : `区间漂移预览中：${driftRange.length} 条 · 缩放 ${
+              driftPlan && Number.isFinite(driftPlan.scale)
+                ? `${(driftPlan.scale * 100).toFixed(1)}%`
+                : '—'
+            }`
+      );
+    }
     if (cues.length > 0) parts.push(`已记录 ${history.past.length} 次调整`);
     return parts.join(' · ');
   }, [
@@ -400,7 +552,10 @@ export default function App() {
     loopRange,
     loopEnabled,
     loopDisabled,
-    shadowBusy
+    shadowBusy,
+    driftOpen,
+    driftRange,
+    driftPlan
   ]);
 
   return (
@@ -447,6 +602,7 @@ export default function App() {
             <span>{statusText}</span>
             <span className="status-hint">
               拖动字幕块左右边界校对 · 靠近静音带边缘 150ms 自动吸附 · 越界自动回弹并提示原因 · 点击字幕块定位播放
+              {' · '}列表 Shift+点击框选区间后可「📐 区间漂移」整体线性校准
             </span>
           </div>
           <Timeline
@@ -460,6 +616,8 @@ export default function App() {
             silences={silenceSegments}
             snapEnabled={snapEnabled}
             loopRange={loopActive ? loopRange : null}
+            driftPlan={driftPlan}
+            driftLocateNonce={driftLocateNonce}
             onSelect={setSelectedId}
             onSeek={seekAndPlay}
             onCommit={commit}
@@ -472,12 +630,29 @@ export default function App() {
             onNotice={(text) => pushToast('warn', text)}
             onBusyChange={handleShadowBusyChange}
           />
+          {driftOpen && driftRange && (
+            <DriftPanel
+              range={driftRange}
+              targetStartRaw={driftTargetStart}
+              targetEndRaw={driftTargetEnd}
+              onTargetStartChange={setDriftTargetStart}
+              onTargetEndChange={setDriftTargetEnd}
+              plan={driftPlan}
+              onApply={handleApplyDrift}
+              onCancel={clearDrift}
+              onLocateConflict={handleLocateConflict}
+            />
+          )}
         </section>
         <CueList
           cues={cues}
           currentTime={currentTime}
           selectedId={selectedId}
-          onSelect={setSelectedId}
+          rangeIds={driftRange && driftFirstId ? driftRangeIds : undefined}
+          anchorId={driftFirstId}
+          hasDriftRange={!!driftRange && driftRange.length > 1}
+          onSelect={handleListSelect}
+          onStartDrift={handleStartDrift}
           onSeek={seekAndPlay}
         />
       </main>

@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Constraints, Cue, DragEdge, RejectReason, SilenceSegment } from '../types';
 import { applyEdge } from '../lib/cues';
 import { formatClock } from '../lib/srt';
 import { resolveEdgeCandidate, type SnapEdge } from '../lib/silence';
 import type { LoopRange } from '../lib/abLoop';
+import type { DriftPlan } from '../lib/drift';
 
 interface TimelineProps {
   cues: Cue[];
@@ -20,6 +21,10 @@ interface TimelineProps {
   snapEnabled: boolean;
   /** 当前生效的 A-B 循环区间；未开启时为 null */
   loopRange: LoopRange | null;
+  /** 区间漂移预览：含原始区间与映射结果（可能带冲突）；未开启时 null */
+  driftPlan: DriftPlan | null;
+  /** 请求定位漂移首个冲突的递增令牌（变化即滚动到 driftLocateTime） */
+  driftLocateNonce: number;
   onSelect: (id: string | null) => void;
   onSeek: (t: number) => void;
   /** 合法拖放结束：提交边界并进入历史栈 */
@@ -78,6 +83,8 @@ export default function Timeline({
   silences,
   snapEnabled,
   loopRange,
+  driftPlan,
+  driftLocateNonce,
   onSelect,
   onSeek,
   onCommit,
@@ -173,6 +180,23 @@ export default function Timeline({
     () => [...cues].sort((a, b) => a.start - b.start || a.end - b.end),
     [cues]
   );
+
+  // 漂移定位：请求「定位首个冲突」时把冲突时间（或目标起点）滚动到视野约 1/3 处
+  useEffect(() => {
+    if (driftLocateNonce === 0 || !driftPlan?.conflict) return;
+    const t = driftPlan.conflict.time;
+    if (t === null) return;
+    const lane = laneScrollRef.current;
+    if (!lane) return;
+    lane.scrollTo({ left: Math.max(0, t * pps - lane.clientWidth * 0.3), behavior: 'smooth' });
+  }, [driftLocateNonce, driftPlan, pps]);
+
+  // 漂移预览的索引表：区间内 id -> 映射结果；未开启预览为空
+  const driftMap = useMemo(() => {
+    const m = new Map<string, { start: number; end: number; index: number }>();
+    if (driftPlan) driftPlan.mapped.forEach((x) => m.set(x.cue.id, { start: x.newStart, end: x.newEnd, index: x.index }));
+    return m;
+  }, [driftPlan]);
 
   const timelineEnd = useMemo(() => {
     const lastCue = sorted.length > 0 ? sorted[sorted.length - 1].end : 0;
@@ -351,6 +375,25 @@ export default function Timeline({
               </div>
             </>
           )}
+          {/* 漂移目标锚点旗标（标尺）：橙 = 新起点，青 = 新终点 */}
+          {driftPlan && driftPlan.conflict?.kind !== 'bad-input' && driftPlan.conflict?.kind !== 'target-negative' && (
+            <>
+              <div
+                className="drift-flag drift-flag-start"
+                style={{ left: driftPlan.targetStart * pps }}
+                title={`漂移目标起点 ${formatClock(driftPlan.targetStart)}`}
+              >
+                新A
+              </div>
+              <div
+                className="drift-flag drift-flag-end"
+                style={{ left: driftPlan.targetEnd * pps }}
+                title={`漂移目标终点 ${formatClock(driftPlan.targetEnd)}`}
+              >
+                新B
+              </div>
+            </>
+          )}
           {duration > 0 && (
             <div className="audio-end" style={{ left: duration * pps }} title={`音频结尾 ${formatClock(duration)}`}>
               ♫
@@ -412,6 +455,8 @@ export default function Timeline({
           )}
 
           {sorted.map((cue) => {
+            // 漂移预览期间，区间内字幕改由下方的专用层渲染（旧位虚框 + 新位亮块）
+            if (driftMap.has(cue.id)) return null;
             const v = visualCue(cue);
             const isDragTarget = drag?.cueId === cue.id;
             const invalid = isDragTarget && !drag?.valid;
@@ -465,6 +510,66 @@ export default function Timeline({
               </div>
             );
           })}
+
+          {/* 区间漂移预览：旧位置虚框 + 映射后亮块；冲突字幕红框并连接旧→新位置 */}
+          {driftPlan &&
+            driftPlan.mapped.map((m) => {
+              const conflictHere = driftPlan.conflict?.cueId === m.cue.id;
+              const oldLeft = m.cue.start * pps;
+              const oldWidth = Math.max(4, (m.cue.end - m.cue.start) * pps);
+              const newLeft = Math.max(0, m.newStart) * pps;
+              const newWidth = Math.max(4, (m.newEnd - m.newStart) * pps);
+              return (
+                <Fragment key={`drift-${m.cue.id}`}>
+                  <div
+                    className="drift-old"
+                    style={{ left: oldLeft, width: oldWidth, top: 12, height: LANE_HEIGHT }}
+                    title={`旧位置 ${formatClock(m.cue.start)} → ${formatClock(m.cue.end)}`}
+                  />
+                  {newLeft > oldLeft + oldWidth + 2 && (
+                    <div
+                      className="drift-shift"
+                      style={{ left: oldLeft + oldWidth, width: newLeft - oldLeft - oldWidth, top: 12, height: LANE_HEIGHT }}
+                    />
+                  )}
+                  {oldLeft > newLeft + newWidth + 2 && (
+                    <div
+                      className="drift-shift"
+                      style={{ left: newLeft + newWidth, width: oldLeft - newLeft - newWidth, top: 12, height: LANE_HEIGHT }}
+                    />
+                  )}
+                  <div
+                    className={['drift-new', conflictHere && 'conflict'].filter(Boolean).join(' ')}
+                    style={{ left: newLeft, width: newWidth, top: 12, height: LANE_HEIGHT }}
+                    title={`映射后 ${formatClock(m.newStart)} → ${formatClock(m.newEnd)}（${(
+                      m.newEnd - m.newStart
+                    ).toFixed(3)}s）${conflictHere ? `\n⛔ ${driftPlan.conflict?.message ?? ''}` : ''}`}
+                  >
+                    <span className="drift-new-text">{m.cue.text.split('\n')[0]}</span>
+                    <span className="drift-new-idx">#{m.index}</span>
+                  </div>
+                </Fragment>
+              );
+            })}
+
+          {/* 漂移缩放比例徽标：悬浮在新映射区间上方 */}
+          {driftPlan && Number.isFinite(driftPlan.scale) && (
+            <div
+              className={[
+                'drift-scale-badge',
+                driftPlan.conflict ? 'conflict' : 'ok'
+              ].join(' ')}
+              style={{
+                left: Math.min(
+                  Math.max(0, driftPlan.targetStart * pps + 8),
+                  trackWidth - 190
+                ),
+                top: -2
+              }}
+            >
+              缩放 {driftPlan.scale.toFixed(4)}×（{(driftPlan.scale * 100).toFixed(1)}%）
+            </div>
+          )}
 
           {/* 红色虚影：非法拖到的位置 */}
           {reject && dragCue && (

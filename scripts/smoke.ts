@@ -29,6 +29,13 @@ import {
   pickRecorderMimeType,
   trackDrift
 } from '../src/lib/shadow';
+import {
+  applyDriftPlan,
+  buildDriftPlan,
+  formatDriftInput,
+  parseDriftInput,
+  resolveDriftRange
+} from '../src/lib/drift';
 
 let fail = 0;
 function assert(cond: boolean, msg: string) {
@@ -340,6 +347,217 @@ assert(rr.snapped && rr.time === 2.0 && rr.valid, '原候选时长不足但吸�
   assert(noDev.kind === 'device' && noDev.recoverable, '无设备 -> 可恢复提示');
   const unknown = describeGetUserMediaError(new Error('weird'));
   assert(unknown.kind === 'unknown' && unknown.text.includes('weird'), '未知错误保留原文案');
+}
+
+// 19. 区间漂移校准：锚点解析 / 线性映射 / 缩放 / 提交
+{
+  // 输入解析：纯秒、mm:ss、hh:mm:ss,ms、逗号 / 点分隔
+  assert(parseDriftInput('12.5') === 12.5, '漂移输入纯秒 12.5');
+  assert(parseDriftInput('1:02.5') === 62.5, '漂移输入 mm:ss.d');
+  assert(parseDriftInput('00:01:02,500') === 62.5, '漂移输入 SRT 时间码（逗号）');
+  assert(parseDriftInput('00:01:02.5') === 62.5, '漂移输入点毫秒');
+  assert(parseDriftInput('1:62') === null, '秒位 >=60 拒绝');
+  assert(parseDriftInput('') === null && parseDriftInput('abc') === null, '空 / 非法输入返回 null');
+  assert(formatDriftInput(62.5) === '00:01:02,500', '漂移输入回显 SRT 格式');
+
+  const dc = [
+    { id: 'a', start: 0, end: 1, text: 'a' },
+    { id: 'b', start: 2, end: 3, text: 'b' },
+    { id: 'c', start: 4, end: 5, text: 'c' },
+    { id: 'd', start: 6, end: 7, text: 'd' },
+    { id: 'e', start: 8, end: 9, text: 'e' }
+  ];
+  const DR = { minDuration: 0.5, minGap: 0.08 };
+
+  // Shift 选区解析（乱序传端点也可）
+  const rng = resolveDriftRange(dc, 'd', 'b');
+  assert(rng?.map((c) => c.id).join('') === 'bcd', '漂移区间 b..d（倒序端点）');
+  assert(resolveDriftRange(dc, 'a', 'x') === null, '缺失端点 -> null');
+
+  // 纯平移：原锚点 2 -> 3，末锚点 7 -> 8（+1s，等跨度），scale=1；与外邻 e(8) 恰间隔 0
+  // 0.08 以下会被间隔拦截，故平移用 +1s 且外邻 e 起点为 8 -> 末条终点 8 会重叠；
+  // 改为仅与外邻 a(prev,end1) 校验的平移方向：目标 0.08 起、5.08 止
+  let plan = buildDriftPlan(
+    [
+      { id: 'a', start: 0, end: 1, text: 'a' },
+      { id: 'b', start: 2, end: 4, text: 'b' },
+      { id: 'c', start: 5, end: 7, text: 'c' }
+    ],
+    'b',
+    'c',
+    formatDriftInput(2.5),
+    formatDriftInput(7.5),
+    DR
+  );
+  assert(plan !== null && plan.conflict === null, '平移 0.5s 合法（等跨度）');
+  assert(Math.abs(plan!.scale - 1) < 1e-9, '缩放比例 1x');
+  assert(plan!.mapped[0].newStart === 2.5 && plan!.mapped[1].newEnd === 7.5, '锚点精确落到新时间');
+  let applied = applyDriftPlan(
+    [
+      { id: 'a', start: 0, end: 1, text: 'a' },
+      { id: 'b', start: 2, end: 4, text: 'b' },
+      { id: 'c', start: 5, end: 7, text: 'c' }
+    ],
+    plan
+  );
+  assert(applied.find((c) => c.id === 'b')?.start === 2.5, '提交后 b 起点为 2.5');
+  assert(applied.find((c) => c.id === 'a')?.start === 0, '区间外 a 不变');
+  // 平移 +3.5s 后末条 end 10.5 与外邻 e(start8) 重叠 -> 拒绝
+  plan = buildDriftPlan(dc, 'b', 'd', formatDriftInput(5.5), formatDriftInput(10.5), DR);
+  assert(plan !== null && plan.conflict?.kind === 'gap-next', '平移与区间外下一条重叠被拒');
+
+  // 缩放：3s 区间压到 1.5s，scale=0.5
+  const sq = [
+    { id: 'a', start: 0, end: 1, text: 'a' },
+    { id: 'b', start: 2, end: 3, text: 'b' },
+    { id: 'c', start: 4, end: 5, text: 'c' },
+    { id: 'd', start: 10, end: 11, text: 'd' }
+  ];
+  plan = buildDriftPlan(sq, 'b', 'c', formatDriftInput(2), formatDriftInput(3.5), {
+    minDuration: 0.5,
+    minGap: 0.08
+  });
+  assert(plan !== null && plan.conflict === null, '缩放 0.5x 合法（区间内各块 0.5s 时长达标）');
+  assert(Math.abs(plan!.scale - 0.5) < 1e-9, '缩放比例 0.5x');
+  assert(plan!.mapped[0].newStart === 2 && plan!.mapped[0].newEnd === 2.5, 'b 映射为 2~2.5');
+  assert(plan!.mapped[1].newStart === 3 && plan!.mapped[1].newEnd === 3.5, 'c 映射为 3~3.5');
+
+  // 缩到 0.4x：块时长 0.4 < 0.5，首个冲突是第 1 条时长
+  plan = buildDriftPlan(sq, 'b', 'c', formatDriftInput(2), formatDriftInput(3.2), DR);
+  assert(plan?.conflict?.kind === 'duration', '缩放后时长不足 -> duration 冲突');
+  assert(plan!.conflict?.cueId === 'b' && plan!.conflict.message.includes('第 1 条'), '首个冲突定位到区间第 1 条');
+
+  // 目标锚点倒序（相等也算倒序）
+  plan = buildDriftPlan(sq, 'b', 'c', formatDriftInput(5), formatDriftInput(5), DR);
+  assert(plan?.conflict?.kind === 'target-order' && plan!.conflict.cueId === null, '目标锚点相等 -> 倒序冲突（无定位字幕）');
+  plan = buildDriftPlan(sq, 'b', 'c', 'garbage', formatDriftInput(5), DR);
+  assert(plan?.conflict?.kind === 'bad-input', '起点输入非法 -> bad-input');
+
+  // 越过 0s 无法由合法输入构造：解析层拒绝负数，且 scale>0、targetStart>=0 时
+  // 所有映射时间都 >= targetStart>=0 —— new-negative 被前置检查完全覆盖
+  assert(parseDriftInput('-1') === null, '负时间输入在解析层即被拒绝');
+
+  // 区间内间隔被压缩：b(2~3)/c(4~5) 压到 scale=0.4，新间隔 3.0-2.4=0.6 合法；
+  // 再压 scale=0.3：b 2~2.3，c 2.6~2.9 间隔 0.3 合法；scale=0.2：间隔 0.2 合法；
+  // 构造时长达标但间隔不足：块短、间隙大的序列
+  const gapCues = [
+    { id: 'a', start: 0, end: 0.6, text: 'a' },
+    { id: 'b', start: 2, end: 2.6, text: 'b' }
+  ];
+  // 原区间 2.6s；映射到 1.3s（scale 0.5）：a 0~0.3 时长不足 -> duration 先报
+  plan = buildDriftPlan(gapCues, 'a', 'b', '00:00:00,000', '00:00:01,300', {
+    minDuration: 0.2,
+    minGap: 0.08
+  });
+  // a: 0~0.3 时长 0.3；b: 1~1.3；间隔 0.7 合法
+  assert(plan?.conflict === null, '短块 + 大间隔缩放到 1.3s 合法');
+  // 映射到 0.8s（scale≈0.3077）：a end≈0.1846 时长不足 -> duration
+  plan = buildDriftPlan(gapCues, 'a', 'b', '00:00:00,000', '00:00:00,800', {
+    minDuration: 0.2,
+    minGap: 0.08
+  });
+  assert(plan?.conflict?.kind === 'duration', '缩放后首条时长不足优先于间隔报错');
+
+  // 构造「时长达标、间隔不足」：两条紧邻 0.08 间隙，放大间隔反而不会不足；
+  // 缩小间隙：原 0~0.9 与 1.0~1.9（间隙 0.1），映射到 0~1.0（scale≈0.526）：
+  // a 0~0.474 时长 0.474；b 0.526~1.0；间隔 0.052 < 0.08
+  const gapCues2 = [
+    { id: 'a', start: 0, end: 0.9, text: 'a' },
+    { id: 'b', start: 1, end: 1.9, text: 'b' }
+  ];
+  plan = buildDriftPlan(gapCues2, 'a', 'b', '00:00:00,000', '00:00:01,000', {
+    minDuration: 0.2,
+    minGap: 0.08
+  });
+  assert(plan?.conflict?.kind === 'gap-next', '缩放后区间内间隔不足 -> gap-next');
+  assert(plan!.conflict?.cueId === 'a' && plan!.conflict.time !== null, '间隔冲突定位到前一条并带时间');
+
+  // 区间外上一条：首条直接映射到 0，但上一条结束在 0.5
+  const outer = [
+    { id: 'p', start: 0, end: 0.5, text: 'p' },
+    { id: 'a', start: 2, end: 3, text: 'a' }
+  ];
+  plan = buildDriftPlan(outer, 'a', 'a', '00:00:00,200', '00:00:01,200', DR);
+  assert(plan?.conflict?.kind === 'gap-prev', '与区间外上一条间隔不足 -> gap-prev');
+  plan = buildDriftPlan(outer, 'a', 'a', '00:00:00,300', '00:00:01,300', DR);
+  // 间隔 0.3-0.5 = -0.2 重叠
+  assert(plan?.conflict?.kind === 'gap-prev' && plan!.conflict.message.includes('重叠'), '与区间外上一条重叠');
+  plan = buildDriftPlan(outer, 'a', 'a', '00:00:00,580', '00:00:01,580', DR);
+  assert(plan?.conflict === null, '与区间外上一条间隔恰好 0.08 合法');
+
+  // 放大：scale>1，各时间线性外扩（11s 区间拉到 40s）
+  plan = buildDriftPlan(
+    [
+      { id: 'a', start: 0, end: 1, text: 'a' },
+      { id: 'b', start: 10, end: 11, text: 'b' }
+    ],
+    'a',
+    'b',
+    '00:00:00,000',
+    '00:00:40,000',
+    DR
+  );
+  assert(plan?.conflict === null && Math.abs(plan!.scale - 40 / 11) < 1e-9, '放大合法且比例为 40/11');
+  assert(plan!.mapped[1].newStart === Math.round((40 / 11) * 10 * 1000) / 1000, '放大后内部锚点线性映射');
+
+  // 单条区间：scale 恒为 1，等价于平移（无区间外邻居）
+  plan = buildDriftPlan(
+    [{ id: 'a', start: 1, end: 2, text: 'a' }],
+    'a',
+    'a',
+    '00:00:05,000',
+    '00:00:06,000',
+    DR
+  );
+  assert(plan?.conflict === null && plan!.mapped[0].newStart === 5 && plan!.mapped[0].newEnd === 6, '单条区间平移 5~6');
+  // 单条目标起止差值不等于原时长（倒序之外的任意值）：锚点严格映射，允许重定时长
+  plan = buildDriftPlan(
+    [{ id: 'a', start: 1, end: 2, text: 'a' }],
+    'a',
+    'a',
+    '00:00:05,000',
+    '00:00:05,600',
+    DR
+  );
+  assert(plan?.conflict === null && Math.abs(plan!.scale - 0.6) < 1e-9, '单条区间可缩放（目标差值即新时长）');
+
+  // 提交进入历史后可整体撤销重做
+  {
+    let h = initHistory(sq);
+    const p = buildDriftPlan(sq, 'b', 'c', formatDriftInput(2), formatDriftInput(3.5), {
+      minDuration: 0.5,
+      minGap: 0.08
+    })!;
+    h = commitHistory(h, applyDriftPlan(sq, p));
+    assert(h.past.length === 1, '漂移提交进入历史栈');
+    h = undoHistory(h);
+    assert(h.present.find((c) => c.id === 'b')?.start === 2, '撤销整体恢复漂移前时间');
+    h = redoHistory(h);
+    assert(h.present.find((c) => c.id === 'b')?.start === 2 && h.present.find((c) => c.id === 'b')?.end === 2.5, '重做再次应用漂移');
+  }
+
+  // 漂移结果随 SRT 导出（按新时间排序编号）
+  {
+    const p = buildDriftPlan(
+      [
+        { id: 'a', start: 0, end: 1, text: '一' },
+        { id: 'b', start: 2, end: 3, text: '二' }
+      ],
+      'a',
+      'b',
+      '00:00:10,000',
+      '00:00:13,000',
+      DR
+    )!;
+    const out = serializeSrt(applyDriftPlan(
+      [
+        { id: 'a', start: 0, end: 1, text: '一' },
+        { id: 'b', start: 2, end: 3, text: '二' }
+      ],
+      p
+    ));
+    assert(out.includes('00:00:10,000 --> 00:00:11,000') && out.includes('00:00:12,000 --> 00:00:13,000'), '漂移结果可由现有 SRT 导出');
+  }
 }
 
 process.exit(fail ? 1 : 0);

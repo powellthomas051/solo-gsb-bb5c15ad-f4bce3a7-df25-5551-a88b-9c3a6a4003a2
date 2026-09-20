@@ -685,7 +685,15 @@ body {
   border-bottom: 1px solid var(--line);
   display: flex;
   justify-content: space-between;
-  align-items: baseline;
+  align-items: center;
+  gap: 8px;
+}
+
+.cue-list-head > span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
 }
 
 .cue-list-head .hint {
@@ -1057,4 +1065,323 @@ body {
 
 .loop-state.suspended {
   color: var(--danger);
+}
+
+/* ---------------- 区间漂移校准 ---------------- */
+
+.drift-dock {
+  flex: 0 0 auto;
+  background: var(--bg-panel);
+  border-top: 1px solid #b58cff;
+  box-shadow: inset 0 1px 0 rgba(181, 140, 255, 0.35);
+  font-size: 13px;
+}
+
+.drift-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 16px 4px;
+}
+
+.drift-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: #e4d6ff;
+  white-space: nowrap;
+}
+
+.drift-range-info {
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.drift-body {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 2px 16px 10px;
+}
+
+.drift-anchors {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+
+.drift-anchor {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.drift-anchor-name {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.drift-origin {
+  font-size: 12px;
+  color: #c9aaff;
+  font-variant-numeric: tabular-nums;
+  background: rgba(96, 63, 166, 0.25);
+  border: 1px solid rgba(181, 140, 255, 0.35);
+  border-radius: 6px;
+  padding: 3px 8px;
+}
+
+.drift-arrow {
+  color: var(--text-dim);
+}
+
+.drift-input {
+  width: 132px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: #0e1424;
+  color: var(--text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.drift-input:focus {
+  outline: none;
+  border-color: #b58cff;
+  box-shadow: 0 0 0 2px rgba(181, 140, 255, 0.25);
+}
+
+.drift-stats {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.drift-stats strong {
+  color: var(--text);
+}
+
+.drift-scale {
+  margin-left: 4px;
+  padding: 2px 10px;
+  border-radius: 10px;
+  background: rgba(96, 63, 166, 0.22);
+  border: 1px solid rgba(181, 140, 255, 0.4);
+  color: #e4d6ff;
+}
+
+.drift-scale-pct {
+  color: var(--text-dim);
+  font-style: normal;
+  margin-left: 2px;
+}
+
+.drift-stats.has-conflict .drift-scale {
+  background: rgba(255, 93, 108, 0.14);
+  border-color: rgba(255, 93, 108, 0.5);
+  color: #ffd7db;
+}
+
+.drift-stats.ok .drift-scale {
+  background: rgba(31, 122, 82, 0.25);
+  border-color: rgba(63, 208, 143, 0.5);
+  color: #c3f7e3;
+}
+
+.drift-conflict {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  background: #38151c;
+  border: 1px solid var(--danger);
+  color: #ffd7db;
+  font-size: 12px;
+}
+
+.drift-conflict-msg {
+  font-variant-numeric: tabular-nums;
+}
+
+.drift-ok-hint {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.drift-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.drift-tip {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* 时间轴上的漂移预览 */
+
+.drift-old {
+  position: absolute;
+  border: 1px dashed rgba(181, 140, 255, 0.75);
+  border-radius: 8px;
+  background: rgba(181, 140, 255, 0.05);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.drift-shift {
+  position: absolute;
+  pointer-events: none;
+  z-index: 1;
+  background-image: linear-gradient(
+    rgba(181, 140, 255, 0.35) 50%,
+    transparent 50%
+  );
+  background-size: 10px 2px;
+  background-repeat: repeat-x;
+  background-position: center;
+}
+
+.drift-new {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  border-radius: 8px;
+  border: 1px solid #b58cff;
+  background: linear-gradient(180deg, #6b46b8, #4c2f8d);
+  box-shadow: 0 2px 10px rgba(120, 80, 220, 0.45);
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 4;
+  animation: drift-pop 0.15s ease;
+}
+
+@keyframes drift-pop {
+  from { box-shadow: 0 0 0 1px rgba(181, 140, 255, 0.5); }
+  to { box-shadow: 0 2px 10px rgba(120, 80, 220, 0.45); }
+}
+
+.drift-new.conflict {
+  border-color: var(--danger);
+  background: repeating-linear-gradient(
+    45deg,
+    #7a2430,
+    #7a2430 8px,
+    #5e1b25 8px,
+    #5e1b25 16px
+  );
+  box-shadow: 0 0 0 2px rgba(255, 93, 108, 0.55), 0 2px 12px rgba(255, 93, 108, 0.4);
+  animation: drift-conflict-pulse 1s ease-in-out infinite;
+}
+
+@keyframes drift-conflict-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(255, 93, 108, 0.55); }
+  50% { box-shadow: 0 0 0 4px rgba(255, 93, 108, 0.25); }
+}
+
+.drift-new-text {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #f1e9ff;
+}
+
+.drift-new-idx {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: #d9c8ff;
+  background: rgba(0, 0, 0, 0.3);
+  align-self: flex-start;
+  padding: 1px 6px;
+  border-bottom-left-radius: 8px;
+  border-top-right-radius: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.drift-flag {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.4;
+  padding: 0 5px;
+  border-radius: 4px;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.drift-flag-start {
+  color: #ffe6c2;
+  background: rgba(180, 116, 20, 0.92);
+}
+
+.drift-flag-end {
+  color: #cff7ea;
+  background: rgba(20, 130, 102, 0.92);
+}
+
+.drift-scale-badge {
+  position: absolute;
+  font-size: 11px;
+  padding: 2px 10px;
+  border-radius: 10px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  z-index: 9;
+  pointer-events: none;
+}
+
+.drift-scale-badge.ok {
+  color: #c3f7e3;
+  background: rgba(15, 60, 42, 0.92);
+  border: 1px solid rgba(63, 208, 143, 0.6);
+}
+
+.drift-scale-badge.conflict {
+  color: #ffd7db;
+  background: rgba(56, 21, 28, 0.92);
+  border: 1px solid rgba(255, 93, 108, 0.6);
+}
+
+/* 字幕列表中的漂移框选态 */
+
+.cue-row.in-drift-range {
+  background: rgba(96, 63, 166, 0.16);
+  box-shadow: inset 2px 0 0 rgba(181, 140, 255, 0.7);
+}
+
+.cue-row.in-drift-range:hover {
+  background: rgba(96, 63, 166, 0.26);
+}
+
+.cue-row.drift-anchor {
+  box-shadow: inset 3px 0 0 #b58cff;
+}
+
+.cue-row.selected.in-drift-range {
+  background: rgba(60, 52, 110, 0.75);
+}
+
+.drift-anchor-tag {
+  color: #c9aaff;
+  margin-right: 2px;
+  font-size: 9px;
+}
+
+.cue-list-head .drift-entry {
+  font-size: 11px;
+  padding: 3px 8px;
 }
