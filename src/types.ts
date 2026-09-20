@@ -40,6 +40,23 @@ export interface SilenceSegment {
 /** 静音分析状态 */
 export type SilenceStatus = 'idle' | 'analyzing' | 'done' | 'error';
 
+/** 区间漂移校准的时间轴预览（应用前展示，不修改数据） */
+export interface DriftPreview {
+  /** 区间内字幕 id（时间序），用于把原块标记为「旧位置」 */
+  rangeIds: string[];
+  /** 区间内字幕映射后的新位置（虚影） */
+  mapped: Cue[];
+  /** 目标锚点（新锚点标记线） */
+  newStart: number;
+  newEnd: number;
+  /** 缩放比例（目标区间长 / 原区间长） */
+  scale: number;
+  /** false = 存在冲突，预览以红色呈现 */
+  valid: boolean;
+  /** 首个冲突字幕 id（高亮定位）；无冲突为 null */
+  conflictCueId: string | null;
+}
+
 /** 导入结果 */
 export interface ParseResult {
   cues: Cue[];

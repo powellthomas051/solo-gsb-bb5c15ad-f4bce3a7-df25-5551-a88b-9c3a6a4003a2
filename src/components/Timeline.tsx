@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { Constraints, Cue, DragEdge, RejectReason, SilenceSegment } from '../types';
+import type { Constraints, Cue, DragEdge, DriftPreview, RejectReason, SilenceSegment } from '../types';
 import { applyEdge } from '../lib/cues';
 import { formatClock } from '../lib/srt';
 import { resolveEdgeCandidate, type SnapEdge } from '../lib/silence';
@@ -20,6 +20,10 @@ interface TimelineProps {
   snapEnabled: boolean;
   /** 当前生效的 A-B 循环区间；未开启时为 null */
   loopRange: LoopRange | null;
+  /** 区间漂移校准预览（旧/新位置与缩放比例）；未校准为 null */
+  driftPreview: DriftPreview | null;
+  /** 变化时强制重新滚动到选中字幕（定位冲突时选中项可能未变） */
+  focusNonce: number;
   onSelect: (id: string | null) => void;
   onSeek: (t: number) => void;
   /** 合法拖放结束：提交边界并进入历史栈 */
@@ -78,6 +82,8 @@ export default function Timeline({
   silences,
   snapEnabled,
   loopRange,
+  driftPreview,
+  focusNonce,
   onSelect,
   onSeek,
   onCommit,
@@ -155,11 +161,12 @@ export default function Timeline({
     }
   }, [currentTime, isPlaying, pps]);
 
-  // 选中（列表点击等）时滚动到目标块
-  const selectedRef = useRef<string | null>(null);
+  // 选中（列表点击、定位冲突等）时滚动到目标块；focusNonce 变化时强制重新滚动
+  const selectedRef = useRef<{ id: string | null; nonce: number }>({ id: null, nonce: -1 });
   useEffect(() => {
-    if (!selectedId || selectedRef.current === selectedId) return;
-    selectedRef.current = selectedId;
+    if (!selectedId) return;
+    if (selectedRef.current.id === selectedId && selectedRef.current.nonce === focusNonce) return;
+    selectedRef.current = { id: selectedId, nonce: focusNonce };
     const cue = cues.find((c) => c.id === selectedId);
     const lane = laneScrollRef.current;
     if (!cue || !lane) return;
@@ -167,11 +174,17 @@ export default function Timeline({
     if (x < lane.scrollLeft || x > lane.scrollLeft + lane.clientWidth - 60) {
       lane.scrollTo({ left: Math.max(0, x - lane.clientWidth * 0.3), behavior: 'smooth' });
     }
-  }, [selectedId, cues, pps]);
+  }, [selectedId, focusNonce, cues, pps]);
 
   const sorted = useMemo(
     () => [...cues].sort((a, b) => a.start - b.start || a.end - b.end),
     [cues]
+  );
+
+  // 区间漂移：旧位置（原块半透明）集合
+  const driftSourceSet = useMemo(
+    () => new Set(driftPreview?.rangeIds ?? []),
+    [driftPreview]
   );
 
   const timelineEnd = useMemo(() => {
@@ -429,7 +442,8 @@ export default function Timeline({
                   'cue',
                   selected && 'selected',
                   active && 'playing',
-                  invalid && 'invalid'
+                  invalid && 'invalid',
+                  driftSourceSet.has(cue.id) && 'drift-source'
                 ].filter(Boolean).join(' ')}
                 style={{ left, width, top: 12, height: LANE_HEIGHT }}
                 title={`${formatClock(cue.start)} → ${formatClock(cue.end)}\n${cue.text.replace(/\n/g, ' ')}`}
@@ -465,6 +479,49 @@ export default function Timeline({
               </div>
             );
           })}
+
+          {/* 区间漂移预览：虚影为映射后新位置（原块半透明为旧位置），冲突时整体变红 */}
+          {driftPreview && (
+            <>
+              {driftPreview.mapped.map((mc) => (
+                <div
+                  key={`drift-${mc.id}`}
+                  className={[
+                    'drift-ghost',
+                    !driftPreview.valid && 'invalid',
+                    driftPreview.conflictCueId === mc.id && 'conflict'
+                  ].filter(Boolean).join(' ')}
+                  style={{
+                    left: Math.max(0, mc.start) * pps,
+                    width: Math.max(4, (mc.end - mc.start) * pps),
+                    top: 12,
+                    height: LANE_HEIGHT
+                  }}
+                  title={`新位置 ${formatClock(mc.start)} → ${formatClock(mc.end)}`}
+                />
+              ))}
+              <div
+                className={`drift-anchor-line ${driftPreview.valid ? '' : 'invalid'}`}
+                style={{ left: driftPreview.newStart * pps }}
+                title={`新区间起点 ${formatClock(driftPreview.newStart)}`}
+              >
+                <span className="drift-anchor-tag">新起点 {formatClock(driftPreview.newStart)}</span>
+              </div>
+              <div
+                className={`drift-anchor-line right ${driftPreview.valid ? '' : 'invalid'}`}
+                style={{ left: driftPreview.newEnd * pps }}
+                title={`新区间终点 ${formatClock(driftPreview.newEnd)}`}
+              >
+                <span className="drift-anchor-tag">新终点 {formatClock(driftPreview.newEnd)}</span>
+              </div>
+              <div
+                className={`drift-scale-bubble ${driftPreview.valid ? '' : 'invalid'}`}
+                style={{ left: ((driftPreview.newStart + driftPreview.newEnd) / 2) * pps }}
+              >
+                缩放 ×{driftPreview.scale.toFixed(3)}
+              </div>
+            </>
+          )}
 
           {/* 红色虚影：非法拖到的位置 */}
           {reject && dragCue && (
